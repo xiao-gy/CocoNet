@@ -1,0 +1,64 @@
+name: build
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+  pull_request: {}
+
+jobs:
+  build-matrix:
+    name: Build ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+
+      - name: Build (release)
+        run: cargo build --release --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CocoNet-${{ matrix.os }}-${{ runner.arch }}
+          path: |
+            target/release/CocoNet${{ runner.os == 'Windows' && '.exe' || '' }}
+
+  linux-musl:
+    name: Build linux-musl x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable) with musl target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools pkg-config
+
+      - name: Cache cargo
+        uses: swatinem/rust-cache@v2
+
+      - name: Build (musl, release)
+        run: cargo build --release --target x86_64-unknown-linux-musl --locked
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CocoNet-linux-musl-x86_64
+          path: target/x86_64-unknown-linux-musl/release/CocoNet

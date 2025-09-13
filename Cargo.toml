@@ -1,0 +1,62 @@
+[package]
+name = "CocoNet"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0 OR MIT"
+authors = ["CocoNet Contributors"]
+description = "A decentralized P2P VPN with TUN, dynamic IPAM, relay, and ACL."
+repository = ""
+readme = "README.md"
+
+[dependencies]
+anyhow = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+futures = "0.3"
+cidr = "0.2"
+ipnetwork = "0.20"
+notify = "6"
+rand = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+async-trait = "0.1"
+igd = { version = "0.12", features = ["aio"] }
+
+# TUN support (Linux/macOS). On Windows we will gate usage behind cfg.
+tun = { version = "0.6", default-features = false, features = ["async"] }
+
+# libp2p stack (optional: we will wire progressively). Using a broad feature-set.
+libp2p = { version = "0.53", default-features = false, features = [
+	"macros",
+	"identify",
+	"ping",
+	"kad",
+	"relay",
+	"autonat",
+	"dcutr",
+	"dns",
+	"tcp",
+	"tokio",
+	"tls",
+	"yamux",
+	"noise",
+	"quic",
+	"websocket",
+	"request-response",
+	"gossipsub",
+] }
+
+[features]
+default = ["transport-quic"]
+transport-quic = []
+transport-webrtc = []
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = "s"
