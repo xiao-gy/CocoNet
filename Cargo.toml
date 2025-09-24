@@ -10,27 +10,34 @@ readme = "README.md"
 
 [dependencies]
 anyhow = "1"
-thiserror = "1"
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1", default-features = false, features = [
+	"rt-multi-thread", # multi-threaded runtime
+	"macros",          # #[tokio::main]
+	"net",             # net types
+	"io-util",         # AsyncRead/Write, split, duplex
+	"sync",            # mpsc, oneshot, Mutex
+	"time",            # delays, intervals
+	"process"          # tokio::process::Command
+] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
-clap = { version = "4", features = ["derive"] }
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "env-filter"] }
+clap = { version = "4", default-features = false, features = ["derive", "std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 bytes = "1"
 futures = "0.3"
-cidr = "0.2"
 ipnetwork = "0.20"
-notify = "6"
-rand = "0.8"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-async-trait = "0.1"
-igd = { version = "0.12", features = ["aio"] }
+igd = { version = "0.12", default-features = false, features = ["aio"] }
 
-# TUN support (Linux/macOS). On Windows we will gate usage behind cfg.
-tun = { version = "0.6", default-features = false, features = ["async"] }
+# TUN support
+# - Non-Windows: use `tun` crate
+# - Windows: use `wintun` via wintun.dll
 
-# libp2p stack (optional: we will wire progressively). Using a broad feature-set.
+# libp2p stack (minimized feature set)
+# Keep only what is used by the code: QUIC transport, relay (client/server),
+# kad, ping, identify, gossipsub, autonat, dcutr, dns, mdns, and required
+# transports/muxers for relay fallback (tcp, tls, noise, yamux). Drop websocket & request-response.
 libp2p = { version = "0.53", default-features = false, features = [
 	"macros",
 	"identify",
@@ -46,17 +53,28 @@ libp2p = { version = "0.53", default-features = false, features = [
 	"yamux",
 	"noise",
 	"quic",
-	"websocket",
-	"request-response",
 	"gossipsub",
+	"mdns",
 ] }
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+tun = { version = "0.6", default-features = false, features = ["async"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+wintun = "0.4"
+
+
 [features]
-default = ["transport-quic"]
+# Enable LAN discovery by default
+default = ["mdns"]
+mdns = ["libp2p/mdns"]
 transport-quic = []
 transport-webrtc = []
 
 [profile.release]
 lto = true
 codegen-units = 1
-opt-level = "s"
+opt-level = "z"
+panic = "abort"
+strip = true
+incremental = false

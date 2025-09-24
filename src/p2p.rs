@@ -12,6 +12,7 @@ use libp2p::{
     relay,
     noise, tls, yamux,
 };
+use libp2p::mdns;
 use serde::{Deserialize, Serialize};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use std::str::FromStr;
@@ -37,6 +38,7 @@ struct NetBehaviour {
     autonat: libp2p::autonat::Behaviour,
     relay: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
+    mdns: mdns::tokio::Behaviour,
 }
 
 impl P2pNode {
@@ -90,7 +92,11 @@ impl P2pNode {
                     Toggle::from(None)
                 };
 
-                NetBehaviour { gsub, identify, ping, kad, dcutr, autonat, relay, relay_server }
+                // mDNS for LAN peer discovery
+                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer)
+                    .expect("mdns behaviour");
+
+                NetBehaviour { gsub, identify, ping, kad, dcutr, autonat, relay, relay_server, mdns }
             })?
             .build();
 
@@ -350,6 +356,36 @@ impl P2pNode {
                             SwarmEvent::Behaviour(NetBehaviourEvent::Ping(ev)) => {
                                 tracing::trace!(?ev, "ping");
                             }
+                            SwarmEvent::Behaviour(NetBehaviourEvent::Mdns(ev)) => {
+                                match ev {
+                                    mdns::Event::Discovered(list) => {
+                                        for (peer, addr) in list {
+                                            // 将 mDNS 发现的局域网地址加入 DHT 缓存，并尝试拨号（允许私网）
+                                            swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
+                                            // 仅拨打 IPv4 UDP/quic-v1 或 TCP (quic 上层) 的地址
+                                            if let Some(ma) = rebuild_udp_quic(&addr) { 
+                                                if let Err(e) = swarm.dial(ma.clone()) {
+                                                    tracing::trace!(%peer, addr=%ma, error=%e, "mdns direct dial failed");
+                                                } else {
+                                                    tracing::info!(%peer, addr=%ma, "mdns: attempting direct dial");
+                                                }
+                                            } else {
+                                                // 若无法标准化，直接尝试该地址（可能是 /ip4/.../tcp/...）
+                                                if let Err(e) = swarm.dial(addr.clone()) {
+                                                    tracing::trace!(%peer, addr=%addr, error=%e, "mdns direct dial failed");
+                                                } else {
+                                                    tracing::info!(%peer, addr=%addr, "mdns: attempting direct dial");
+                                                }
+                                            }
+                                        }
+                                    }
+                                    mdns::Event::Expired(list) => {
+                                        for (peer, addr) in list {
+                                            tracing::debug!(%peer, %addr, "mdns expired");
+                                        }
+                                    }
+                                }
+                            }
                             SwarmEvent::Behaviour(NetBehaviourEvent::Kad(ev)) => {
                                 tracing::trace!(?ev, "kad");
                             }
@@ -478,6 +514,11 @@ fn udp_ip_port(addr: &Multiaddr) -> Option<(std::net::Ipv4Addr, u16)> {
 async fn try_upnp_map(local: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
     use igd::{aio::search_gateway, PortMappingProtocol};
     use std::net::SocketAddrV4;
+    // 运行时开关：COCONET_UPNP=0 可禁用（默认启用）
+    if std::env::var("COCONET_UPNP").map(|v| v == "0" || v.eq_ignore_ascii_case("false")).unwrap_or(false) {
+        tracing::info!("UPnP disabled by env COCONET_UPNP=0");
+        return Ok(());
+    }
     let gw = match search_gateway(Default::default()).await {
         Ok(g) => g,
         Err(e) => { tracing::trace!(error=%e, "no igd gateway found"); return Ok(()); }
@@ -491,3 +532,4 @@ async fn try_upnp_map(local: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()
     }
     Ok(())
 }
+

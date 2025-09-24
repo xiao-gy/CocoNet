@@ -27,6 +27,10 @@ struct Cli {
     #[arg(long)]
     ifname: Option<String>,
 
+    /// TUN interface MTU (inner IP). If omitted, uses OS-specific default.
+    #[arg(long)]
+    mtu: Option<u16>,
+
     /// Run as a relay-capable node
     #[arg(long)]
     relay: bool,
@@ -76,7 +80,7 @@ async fn main() -> anyhow::Result<()> {
     // 计算前缀并传入完整 CIDR（例如 10.99.0.42/16），便于内核识别本地地址与直连路由
     let cidr_net: ipnetwork::Ipv4Network = cli.cidr.parse()?;
     let full_addr = format!("{}/{}", virtual_ip, cidr_net.prefix());
-    let (tun_dev, tun_reader, tun_writer) = tun::open_tun(cli.ifname.clone(), full_addr).await?;
+    let (tun_dev, tun_reader, tun_writer) = tun::open_tun(cli.ifname.clone(), cli.mtu, full_addr).await?;
     info!("tun ready ifname={} ip={}", tun_dev.ifname(), virtual_ip);
 
     // Initialize P2P
@@ -84,8 +88,9 @@ async fn main() -> anyhow::Result<()> {
 
     // Spawn tasks: TUN->P2P and P2P->TUN
     let p2p_rx = node.subscribe_packets();
+    let tun_mtu = tun_dev.mtu();
     tokio::spawn(async move {
-        if let Err(e) = routing::pump_p2p_to_tun(p2p_rx, tun_writer).await { eprintln!("p2p->tun error: {e}"); }
+        if let Err(e) = routing::pump_p2p_to_tun(p2p_rx, tun_writer, Some(tun_dev.ifname().to_string()), tun_mtu).await { eprintln!("p2p->tun error: {e}"); }
     });
 
     let p2p_tx = node.sender();

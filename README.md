@@ -18,16 +18,15 @@
 - 详细日志：收/发包方向、五元组摘要、直连/中继切换、NAT 状态等
 
 ## 架构概览
-
-- 控制平面：
-	- Identify 收集对端地址；Kad 存储/查询地址；AutoNAT 判断内外网；DCUtR 升级直连
+ libp2p 0.53（gossipsub/identify/kad/relay/autonat/dcutr/quic 等）
+ tokio、tracing、serde、igd（UPnP，默认启用）
+ tun（异步）
 	- Announce：在 `coconet/announce` 主题上定期广播自身可达公网 UDP/QUIC 地址
 - 数据平面：
 	- TUN -> Gossipsub：从内核 TUN 读出 IP 包，封装为 PubSub 消息
 	- Gossipsub -> TUN：收到的消息写回 TUN，完成虚拟网络互通
 - 连接管理：
 	- 优先直连拨号；当仅有 `/p2p-circuit` 地址时使用中继拨号
-	- 直连建立后关闭同一对等体的中继连接
 
 ## 安装与构建
 
@@ -93,7 +92,7 @@ RUST_LOG=info,coconet=trace ./target/x86_64-unknown-linux-musl/release/CocoNet \
 
 ```text
 --log <FILTER>              RUST_LOG 风格的日志过滤，默认 info,coconet=info
---bootstrap <MA>...         引导多地址（multiaddr），可重复；例 /ip4/1.2.3.4/udp/36826/quic-v1
+--strap <MA>...         引导多地址（multiaddr），可重复；例 /ip4/1.2.3.4/udp/36826/quic-v1
 --cidr <CIDR>               虚拟网段（默认 10.99.0.0/16）
 --ifname <NAME>             TUN 设备名（可选，不填自动分配）
 --relay                     启用中继服务器（默认仅客户端）
@@ -188,4 +187,14 @@ cargo build --release --target x86_64-unknown-linux-musl
 ## 许可
 
 本项目采用 Apache-2.0 或 MIT 双许可。
+
+
+## 备注：MTU 与分片
+
+- 默认在 Windows 使用 Wintun，在 Linux/macOS 使用 TUN。
+- 默认 MTU：Windows 1300，其他平台 1400，可通过 `--mtu` 指定。
+- 为避免超过 MTU 的数据包在注入 TUN 时被丢弃，p2p -> TUN 下行路径实现了用户态 IPv4 分片（RFC 791）：
+	- 当 IPv4 包长度大于 TUN MTU 且未设置 DF 位时，会自动进行 8 字节对齐的分片并重算头部校验和；
+	- 若 DF 位已设置，则不会分片，包将按原样写入（可能被内核丢弃）；
+	- IPv6 中间分片不被允许，超过 MTU 的 IPv6 包会记录告警（后续可扩展 ICMPv6 Packet Too Big）。
 
