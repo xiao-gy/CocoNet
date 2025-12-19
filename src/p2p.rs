@@ -12,11 +12,12 @@ use libp2p::{
     relay,
     noise, tls, yamux,
 };
-use libp2p::mdns;
+use libp2p::request_response::{self, ProtocolSupport, Event as RrEvent, Message as RrMessage, Codec};
 use serde::{Deserialize, Serialize};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use std::str::FromStr;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use bytes::{BytesMut, BufMut};
 
 pub struct P2pNode {
     pub local: PeerId,
@@ -38,7 +39,29 @@ struct NetBehaviour {
     autonat: libp2p::autonat::Behaviour,
     relay: relay::client::Behaviour,
     relay_server: Toggle<relay::Behaviour>,
-    mdns: mdns::tokio::Behaviour,
+    mdns: libp2p::mdns::tokio::Behaviour,
+    data_rr: request_response::Behaviour<DataCodec>,
+}
+
+// ================= Direct Data Protocol over request-response =================
+#[derive(Clone, Debug)] struct DataProtocol;
+impl AsRef<str> for DataProtocol { fn as_ref(&self) -> &str { "/coconet/data/1" } }
+#[derive(Clone, Default)] struct DataCodec;
+#[async_trait::async_trait]
+impl Codec for DataCodec {
+    type Protocol = DataProtocol;
+    type Request = Vec<u8>;
+    type Response = Vec<u8>; // 空响应
+    async fn read_request<T>(&mut self, _: &DataProtocol, io: &mut T) -> std::io::Result<Self::Request>
+    where T: futures::AsyncRead + Unpin + Send {
+        use futures::AsyncReadExt; let mut len_buf=[0u8;4]; io.read_exact(&mut len_buf).await?; let len=u32::from_be_bytes(len_buf) as usize; let mut buf=vec![0u8;len]; io.read_exact(&mut buf).await?; Ok(buf)
+    }
+    async fn read_response<T>(&mut self, _: &DataProtocol, io: &mut T) -> std::io::Result<Self::Response>
+    where T: futures::AsyncRead + Unpin + Send { use futures::AsyncReadExt; let mut len_buf=[0u8;4]; io.read_exact(&mut len_buf).await?; let len=u32::from_be_bytes(len_buf) as usize; let mut buf=vec![0u8;len]; if len>0 { io.read_exact(&mut buf).await?; } Ok(buf) }
+    async fn write_request<T>(&mut self, _: &DataProtocol, io: &mut T, req: Self::Request) -> std::io::Result<()>
+    where T: futures::AsyncWrite + Unpin + Send { use futures::AsyncWriteExt; let len=req.len() as u32; io.write_all(&len.to_be_bytes()).await?; io.write_all(&req).await?; io.flush().await }
+    async fn write_response<T>(&mut self, _: &DataProtocol, io: &mut T, resp: Self::Response) -> std::io::Result<()>
+    where T: futures::AsyncWrite + Unpin + Send { use futures::AsyncWriteExt; let len=resp.len() as u32; io.write_all(&len.to_be_bytes()).await?; if !resp.is_empty() { io.write_all(&resp).await?; } io.flush().await }
 }
 
 impl P2pNode {
@@ -62,8 +85,9 @@ impl P2pNode {
                     .validation_mode(gossipsub::ValidationMode::Permissive)
                     .build()
                     .expect("gossipsub cfg");
+                // 使用 Anonymous 以避免对每个数据面包做 Ed25519 签名的 CPU 开销（性能显著提升）
                 let gsub = gossipsub::Behaviour::<gossipsub::IdentityTransform>::new(
-                    gossipsub::MessageAuthenticity::Signed(id.clone()),
+                    gossipsub::MessageAuthenticity::Anonymous,
                     gcfg,
                 )
                 .expect("gossipsub behaviour");
@@ -93,10 +117,14 @@ impl P2pNode {
                 };
 
                 // mDNS for LAN peer discovery
-                let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), local_peer)
+                let mdns = libp2p::mdns::tokio::Behaviour::new(libp2p::mdns::Config::default(), local_peer)
                     .expect("mdns behaviour");
 
-                NetBehaviour { gsub, identify, ping, kad, dcutr, autonat, relay, relay_server, mdns }
+                // direct data-plane (multi-substream) via request-response
+                let protocols = std::iter::once((DataProtocol, ProtocolSupport::Full));
+                let data_rr = request_response::Behaviour::<DataCodec>::new(protocols, request_response::Config::default());
+
+                NetBehaviour { gsub, identify, ping, kad, dcutr, autonat, relay, relay_server, mdns, data_rr }
             })?
             .build();
 
@@ -135,7 +163,7 @@ impl P2pNode {
         }
 
         // Drive swarm + bridge channel I/O in background.
-        tokio::spawn(async move {
+    tokio::spawn(async move {
             use std::collections::{HashMap, HashSet};
             use std::time::{Duration, Instant};
             let mut relayed_conns: HashMap<PeerId, Vec<ConnectionId>> = HashMap::new();
@@ -234,17 +262,115 @@ impl P2pNode {
                     }
                 }
             }
+            // 批处理聚合：将多个 IP 包封装到单个 gossipsub 消息，减少协议与调度开销
+            // 支持通过环境变量覆盖：
+            //  - COCONET_BATCH_MAX_BYTES (默认 49152)
+            //  - COCONET_BATCH_MAX_PKTS  (默认 128)
+            //  - COCONET_BATCH_INTERVAL_MS (默认 2)
+            fn env_usize(key: &str, default: usize) -> usize {
+                std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+            }
+            fn env_u64(key: &str, default: u64) -> u64 {
+                std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+            }
+            const HDR_LEN: usize = 5; // 'C''O' 0x01 count(u16)
+            let max_batch_bytes: usize = env_usize("COCONET_BATCH_MAX_BYTES", 48 * 1024);
+            let max_batch_pkts: usize = env_usize("COCONET_BATCH_MAX_PKTS", 128);
+            let base_interval_ms: u64 = env_u64("COCONET_BATCH_INTERVAL_MS", 2);
+
+            struct BatchBuilder {
+                buf: BytesMut,     // 带 header
+                pkt_count: u16,
+            }
+            impl BatchBuilder {
+                fn with_capacity(cap: usize) -> Self {
+                    let mut buf = BytesMut::with_capacity(cap.max(HDR_LEN));
+                    // 预写 header 占位，count 两字节后面回填
+                    buf.put_slice(b"CO");
+                    buf.put_u8(0x01); // 版本
+                    buf.put_u8(0);    // 高字节占位
+                    buf.put_u8(0);    // 低字节占位
+                    Self { buf, pkt_count: 0 }
+                }
+                #[inline] fn is_empty(&self) -> bool { self.pkt_count == 0 }
+                #[inline] fn payload_size(&self) -> usize { self.buf.len() - HDR_LEN }
+                #[inline] fn remaining_mut(&self) -> usize { self.buf.capacity() - self.buf.len() }
+                fn add(&mut self, pkt: &Bytes) -> bool {
+                    if self.pkt_count == u16::MAX { return false; }
+                    let needed = 2 + pkt.len();
+                    if self.remaining_mut() < needed { self.buf.reserve(needed); }
+                    self.buf.put_u16(pkt.len() as u16);
+                    self.buf.put_slice(pkt);
+                    self.pkt_count += 1;
+                    true
+                }
+                fn take(&mut self) -> Bytes {
+                    if self.pkt_count == 0 { return Bytes::new(); }
+                    // 回填 count（大端） 位于 buf[3..5)
+                    let hi = (self.pkt_count >> 8) as u8;
+                    let lo = (self.pkt_count & 0xFF) as u8;
+                    // buf 布局: 'C','O',0x01,hi,lo,<payload...>
+                    // 之前我们用的是 4 字节 header，这里扩展到 5，需要在初始化时写 5 字节，但为了兼容旧格式保持 4 + count:u16。
+                    // 因为初始化写了: 'C','O',0x01,0,0 => 5 字节, 修正 HDR_LEN=5 更合理；为避免大范围改动，这里直接插入逻辑调整。
+                    // 为保持与旧解析兼容（旧解析期待长度>=5 并读 data[3], data[4]），我们直接写入。
+                    if self.buf.len() >= 5 { self.buf[3] = hi; self.buf[4] = lo; }
+                    let out = self.buf.split().freeze();
+                    // 重建 header 供后续复用 capacity
+                    self.buf.put_slice(b"CO"); self.buf.put_u8(0x01); self.buf.put_u8(0); self.buf.put_u8(0);
+                    self.pkt_count = 0;
+                    out
+                }
+            }
+
+            let mut batch = BatchBuilder::with_capacity(max_batch_bytes + 4096);
+            let mut interval = tokio::time::interval(std::time::Duration::from_millis(base_interval_ms));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            fn flush_batch(swarm: &mut libp2p::Swarm<NetBehaviour>, topic: &gossipsub::IdentTopic, batch: &mut BatchBuilder, direct_peers: &std::collections::HashSet<PeerId>) {
+                if batch.is_empty() { return; }
+                let pkt_count = batch.pkt_count;
+                let data = batch.take();
+                if data.is_empty() { return; }
+                if direct_peers.is_empty() {
+                    if let Err(e) = swarm.behaviour_mut().gsub.publish(topic.clone(), data) {
+                        tracing::debug!(?e, count=pkt_count, "gossipsub publish (batch) failed");
+                    } else {
+                        tracing::trace!(count=pkt_count, "published batch via gossipsub");
+                    }
+                } else {
+                    for peer in direct_peers.iter() {
+                        let id = swarm.behaviour_mut().data_rr.send_request(peer, data.clone().to_vec());
+                        tracing::trace!(%peer, ?id, count=pkt_count, bytes=data.len(), "direct rr batch sent");
+                    }
+                }
+            }
+
             loop {
                 tokio::select! {
-                    // Outbound from TUN -> publish to pubsub
+                    _ = interval.tick() => {
+                        flush_batch(&mut swarm, &data_topic, &mut batch, &direct_peers);
+                    }
                     maybe_pkt = rx_from_tun.recv() => {
                         match maybe_pkt {
                             Some(pkt) => {
-                                if let Err(e) = swarm.behaviour_mut().gsub.publish(data_topic.clone(), pkt.clone()) {
-                                    tracing::debug!(error = %e, "gossipsub publish failed");
+                                let pkt_len = pkt.len();
+                                // 超过一半批容量的大包直接单发，避免拖慢聚合
+                                if pkt_len > (max_batch_bytes / 2) {
+                                    flush_batch(&mut swarm, &data_topic, &mut batch, &direct_peers);
+                                    if let Err(e) = swarm.behaviour_mut().gsub.publish(data_topic.clone(), pkt) {
+                                        tracing::debug!(?e, "gossipsub publish (large single) failed");
+                                    }
+                                    continue;
                                 }
+                                if batch.pkt_count as usize >= max_batch_pkts || batch.payload_size() + pkt_len + 2 >= max_batch_bytes {
+                                    flush_batch(&mut swarm, &data_topic, &mut batch, &direct_peers);
+                                }
+                                batch.add(&pkt);
                             }
-                            None => break,
+                            None => {
+                                flush_batch(&mut swarm, &data_topic, &mut batch, &direct_peers);
+                                break;
+                            }
                         }
                     }
                     // Swarm events -> forward inbound data-plane messages to TUN
@@ -254,7 +380,24 @@ impl P2pNode {
                                 // 若消息来源就是本地，则跳过（避免潜在的重复处理）
                                 if message.source.as_ref() == Some(&local_peer) { continue; }
                                 if message.topic == data_topic.hash() {
-                                    let _ = tx_to_tun.send(Bytes::from(message.data));
+                                    let data = message.data;
+                                    if data.len() >= 5 && &data[0..2] == b"CO" && data[2] == 0x01 {
+                                        let count = (((data[3] as u16) << 8) | data[4] as u16) as usize;
+                                        let mut idx = 5;
+                                        let mut delivered = 0usize;
+                                        for _ in 0..count {
+                                            if idx + 2 > data.len() { break; }
+                                            let len = u16::from_be_bytes([data[idx], data[idx+1]]) as usize; idx += 2;
+                                            if idx + len > data.len() { break; }
+                                            let slice = &data[idx..idx+len];
+                                            idx += len;
+                                            let _ = tx_to_tun.send(Bytes::copy_from_slice(slice));
+                                            delivered += 1;
+                                        }
+                                        tracing::trace!(raw_count=count, delivered, "unpacked batch packets");
+                                    } else {
+                                        let _ = tx_to_tun.send(Bytes::from(data));
+                                    }
                                 } else if message.topic == ann_topic.hash() {
                                     if let Ok(parsed) = serde_json::from_slice::<AnnounceMsg>(&message.data) {
                                         if let Ok(peer_id) = PeerId::from_str(&parsed.peer) {
@@ -358,7 +501,7 @@ impl P2pNode {
                             }
                             SwarmEvent::Behaviour(NetBehaviourEvent::Mdns(ev)) => {
                                 match ev {
-                                    mdns::Event::Discovered(list) => {
+                                    libp2p::mdns::Event::Discovered(list) => {
                                         for (peer, addr) in list {
                                             // 将 mDNS 发现的局域网地址加入 DHT 缓存，并尝试拨号（允许私网）
                                             swarm.behaviour_mut().kad.add_address(&peer, addr.clone());
@@ -379,7 +522,7 @@ impl P2pNode {
                                             }
                                         }
                                     }
-                                    mdns::Event::Expired(list) => {
+                                    libp2p::mdns::Event::Expired(list) => {
                                         for (peer, addr) in list {
                                             tracing::debug!(%peer, %addr, "mdns expired");
                                         }
@@ -402,6 +545,37 @@ impl P2pNode {
                                 tracing::info!(?ev, "autonat");
                                 // 状态变化为 Public 时，也尝试广播一次自身地址（依赖 ExternalAddrConfirmed 收集地址）
                                 publish_announce(&mut swarm, &my_addrs, &mut last_announce, announce_cooldown, &local_peer, &ann_topic);
+                            }
+                            SwarmEvent::Behaviour(NetBehaviourEvent::DataRr(ev)) => {
+                                match ev {
+                                    RrEvent::Message { peer, message } => match message {
+                                        RrMessage::Request { request, channel, .. } => {
+                                            // 解包同 batch 格式
+                                            if request.len() >= 5 && &request[0..2] == b"CO" && request[2] == 0x01 {
+                                                let count = (((request[3] as u16) << 8) | request[4] as u16) as usize;
+                                                let mut idx = 5; let mut delivered = 0usize;
+                                                for _ in 0..count { if idx + 2 > request.len() { break; } let len = u16::from_be_bytes([request[idx], request[idx+1]]) as usize; idx += 2; if idx + len > request.len() { break; } let slice=&request[idx..idx+len]; idx+=len; let _ = tx_to_tun.send(Bytes::copy_from_slice(slice)); delivered+=1; }
+                                                tracing::trace!(%peer, raw_count=count, delivered, "unpacked direct rr batch packets");
+                                            } else {
+                                                let _ = tx_to_tun.send(Bytes::from(request));
+                                            }
+                                            // 发送空 ACK
+                                            if let Err(e) = swarm.behaviour_mut().data_rr.send_response(channel, Vec::new()) {
+                                                tracing::debug!(%peer, ?e, "send ack failed");
+                                            }
+                                        }
+                                        RrMessage::Response { .. } => { /* 忽略 ACK */ }
+                                    },
+                                    RrEvent::OutboundFailure { peer, error, request_id } => {
+                                        tracing::debug!(%peer, ?request_id, ?error, "direct rr outbound failed");
+                                    }
+                                    RrEvent::InboundFailure { peer, error, request_id } => {
+                                        tracing::debug!(%peer, ?request_id, ?error, "direct rr inbound failed");
+                                    }
+                                    RrEvent::ResponseSent { peer, request_id } => {
+                                        tracing::trace!(%peer, ?request_id, "direct rr response sent");
+                                    }
+                                }
                             }
                             SwarmEvent::NewListenAddr { address, .. } => {
                                 tracing::info!(%address, "listening");
@@ -512,21 +686,21 @@ fn udp_ip_port(addr: &Multiaddr) -> Option<(std::net::Ipv4Addr, u16)> {
 }
 
 async fn try_upnp_map(local: std::net::Ipv4Addr, port: u16) -> anyhow::Result<()> {
-    use igd::{aio::search_gateway, PortMappingProtocol};
+    use igd::{search_gateway, PortMappingProtocol};
     use std::net::SocketAddrV4;
     // 运行时开关：COCONET_UPNP=0 可禁用（默认启用）
     if std::env::var("COCONET_UPNP").map(|v| v == "0" || v.eq_ignore_ascii_case("false")).unwrap_or(false) {
         tracing::info!("UPnP disabled by env COCONET_UPNP=0");
         return Ok(());
     }
-    let gw = match search_gateway(Default::default()).await {
+    let gw = match search_gateway(Default::default()) {
         Ok(g) => g,
         Err(e) => { tracing::trace!(error=%e, "no igd gateway found"); return Ok(()); }
     };
     // 尝试添加/刷新 UDP 端口映射
     let desc = "coconet-quic";
     let local_sock = SocketAddrV4::new(local, port);
-    match gw.add_port(PortMappingProtocol::UDP, port, local_sock, 3600, desc).await {
+    match gw.add_port(PortMappingProtocol::UDP, port, local_sock, 3600, desc) {
         Ok(()) => tracing::info!(port=port, "UPnP mapped UDP port"),
         Err(e) => tracing::debug!(error=%e, port=port, "UPnP map failed"),
     }

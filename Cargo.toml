@@ -28,7 +28,9 @@ bytes = "1"
 futures = "0.3"
 ipnetwork = "0.20"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
-igd = { version = "0.12", default-features = false, features = ["aio"] }
+igd = "0.12"
+mdns = "3.0"
+async-trait = "0.1"
 
 # TUN support
 # - Non-Windows: use `tun` crate
@@ -55,6 +57,7 @@ libp2p = { version = "0.53", default-features = false, features = [
 	"quic",
 	"gossipsub",
 	"mdns",
+	"request-response",
 ] }
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]
