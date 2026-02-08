@@ -168,6 +168,43 @@ async fn configure_iface_addr(ifname: &str, mtu: u16, ip_cidr: &str) -> Result<(
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
+async fn configure_iface_addr(ifname: &str, mtu: u16, ip_cidr: &str) -> Result<()> {
+    use tokio::process::Command;
+    use ipnetwork::Ipv4Network;
+    // 解析出 IP 和网段前缀
+    let net: Ipv4Network = ip_cidr.parse()?;
+    let ip = net.ip();
+    let netmask = net.mask();
+    let cidr_str = format!("{}/{}", net.network(), net.prefix());
+    
+    // 添加地址（macOS 使用 ifconfig）
+    let _ = Command::new("ifconfig")
+        .args([ifname, &ip.to_string(), &netmask.to_string()])
+        .status()
+        .await?;
+    
+    // 设置 MTU
+    let _ = Command::new("ifconfig")
+        .args([ifname, "mtu", &mtu.to_string()])
+        .status()
+        .await?;
+    
+    // 确保接口 up
+    let _ = Command::new("ifconfig")
+        .args([ifname, "up"])
+        .status()
+        .await?;
+    
+    // 添加直连路由到整个虚拟网段
+    let _ = Command::new("route")
+        .args(["-n", "add", "-net", &cidr_str, "-interface", ifname])
+        .status()
+        .await?;
+    
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 async fn configure_iface_addr(ifname: &str, mtu: u16, ip_cidr: &str) -> Result<()> {
     use tokio::process::Command;
