@@ -91,23 +91,29 @@ RUST_LOG=info,coconet=trace ./target/x86_64-unknown-linux-musl/release/CocoNet \
 ## CLI 参考
 
 ```text
+-h, --help                  显示帮助信息
+-V, --version               显示版本信息
 --log <FILTER>              RUST_LOG 风格的日志过滤，默认 info,coconet=info
---strap <MA>...         引导多地址（multiaddr），可重复；例 /ip4/1.2.3.4/udp/36826/quic-v1
+--bootstrap <MA>...         引导多地址（multiaddr），可重复；例 /ip4/1.2.3.4/udp/36826/quic-v1
 --cidr <CIDR>               虚拟网段（默认 10.99.0.0/16）
 --ifname <NAME>             TUN 设备名（可选，不填自动分配）
+--mtu <MTU>                 TUN 接口 MTU（内层 IP），未指定时使用操作系统默认值
 --relay                     启用中继服务器（默认仅客户端）
---listen-port <PORT>        QUIC 监听端口（0=随机）
+--listen-port <PORT>        QUIC 监听端口（0=随机，默认 0）
 
 子命令：
 whoami                      输出本节点 PeerId 与派生虚拟 IP
+help                        显示帮助信息或子命令的帮助信息
 ```
 
 示例：
 
 ```bash
-./CocoNet --bootstrap /ip4/47.122.60.162/udp/36826/quic-v1
-./CocoNet --relay --listen-port 36826
-./CocoNet whoami
+./CocoNet -h                                                   # 显示帮助信息
+./CocoNet --version                                            # 显示版本信息
+./CocoNet --bootstrap /ip4/47.122.60.162/udp/36826/quic-v1    # 连接到引导节点
+./CocoNet --relay --listen-port 36826                          # 作为中继服务器运行
+./CocoNet whoami                                                # 显示本节点信息
 ```
 
 ## 日志与观测
