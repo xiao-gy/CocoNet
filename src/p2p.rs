@@ -81,8 +81,16 @@ impl P2pNode {
             .with_relay_client((tls::Config::new, noise::Config::new), yamux::Config::default)?
             .with_behaviour(|id: &identity::Keypair, relay_client: relay::client::Behaviour| {
                 // gossipsub
+                // 设置 max_transmit_size 以避免超过 UDP MTU 限制（特别是 Windows 平台）
+                // 1200 字节是一个保守且安全的值，可适配大多数网络环境（典型以太网 MTU 1500 减去 IP/UDP 开销）
+                let max_gossip_size: usize = std::env::var("COCONET_MAX_GOSSIP_SIZE")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1200);
+                tracing::info!(max_gossip_size, "gossipsub max_transmit_size configured");
                 let gcfg = gossipsub::ConfigBuilder::default()
                     .validation_mode(gossipsub::ValidationMode::Permissive)
+                    .max_transmit_size(max_gossip_size)
                     .build()
                     .expect("gossipsub cfg");
                 // 使用 Anonymous 以避免对每个数据面包做 Ed25519 签名的 CPU 开销（性能显著提升）
@@ -264,7 +272,8 @@ impl P2pNode {
             }
             // 批处理聚合：将多个 IP 包封装到单个 gossipsub 消息，减少协议与调度开销
             // 支持通过环境变量覆盖：
-            //  - COCONET_BATCH_MAX_BYTES (默认 49152)
+            //  - COCONET_MAX_GOSSIP_SIZE (默认 1200) - gossipsub 单个消息最大字节数
+            //  - COCONET_BATCH_MAX_BYTES (默认等于 MAX_GOSSIP_SIZE) - 批量消息最大字节数
             //  - COCONET_BATCH_MAX_PKTS  (默认 128)
             //  - COCONET_BATCH_INTERVAL_MS (默认 2)
             fn env_usize(key: &str, default: usize) -> usize {
@@ -274,7 +283,17 @@ impl P2pNode {
                 std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
             }
             const HDR_LEN: usize = 5; // 'C''O' 0x01 count(u16)
-            let max_batch_bytes: usize = env_usize("COCONET_BATCH_MAX_BYTES", 48 * 1024);
+            // 获取 gossipsub max_transmit_size 设置，确保批处理不超过此限制
+            let max_gossip_size: usize = env_usize("COCONET_MAX_GOSSIP_SIZE", 1200);
+            // 批处理大小不应超过 gossipsub 限制；如果用户明确设置 BATCH_MAX_BYTES，则使用其设置值但给出警告
+            let max_batch_bytes: usize = env_usize("COCONET_BATCH_MAX_BYTES", max_gossip_size.saturating_sub(HDR_LEN));
+            if max_batch_bytes + HDR_LEN > max_gossip_size {
+                tracing::warn!(
+                    max_batch_bytes, max_gossip_size, 
+                    "COCONET_BATCH_MAX_BYTES ({}) + header exceeds COCONET_MAX_GOSSIP_SIZE ({}); messages may be rejected",
+                    max_batch_bytes, max_gossip_size
+                );
+            }
             let max_batch_pkts: usize = env_usize("COCONET_BATCH_MAX_PKTS", 128);
             let base_interval_ms: u64 = env_u64("COCONET_BATCH_INTERVAL_MS", 2);
 
@@ -354,11 +373,27 @@ impl P2pNode {
                         match maybe_pkt {
                             Some(pkt) => {
                                 let pkt_len = pkt.len();
+                                // 检查包是否超过 gossipsub 最大传输大小
+                                if pkt_len > max_gossip_size {
+                                    tracing::warn!(
+                                        pkt_len, max_gossip_size,
+                                        "dropping packet: size {} exceeds gossipsub max_transmit_size {}",
+                                        pkt_len, max_gossip_size
+                                    );
+                                    continue;
+                                }
                                 // 超过一半批容量的大包直接单发，避免拖慢聚合
                                 if pkt_len > (max_batch_bytes / 2) {
                                     flush_batch(&mut swarm, &data_topic, &mut batch, &direct_peers);
-                                    if let Err(e) = swarm.behaviour_mut().gsub.publish(data_topic.clone(), pkt) {
-                                        tracing::debug!(?e, "gossipsub publish (large single) failed");
+                                    if direct_peers.is_empty() {
+                                        if let Err(e) = swarm.behaviour_mut().gsub.publish(data_topic.clone(), pkt) {
+                                            tracing::debug!(?e, pkt_len, "gossipsub publish (large single) failed");
+                                        }
+                                    } else {
+                                        for peer in direct_peers.iter() {
+                                            let id = swarm.behaviour_mut().data_rr.send_request(peer, pkt.to_vec());
+                                            tracing::trace!(%peer, ?id, bytes=pkt_len, "direct rr single sent");
+                                        }
                                     }
                                     continue;
                                 }

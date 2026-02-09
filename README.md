@@ -198,3 +198,44 @@ cargo build --release --target x86_64-unknown-linux-musl
 	- 若 DF 位已设置，则不会分片，包将按原样写入（可能被内核丢弃）；
 	- IPv6 中间分片不被允许，超过 MTU 的 IPv6 包会记录告警（后续可扩展 ICMPv6 Packet Too Big）。
 
+### Gossipsub 消息大小限制
+
+为解决在负载下出现的 UDP datagram 过大错误（特别是 Windows 平台的错误代码 10040），CocoNet 对 gossipsub 消息大小进行了限制：
+
+- **默认最大消息大小**：1200 字节（通过 `COCONET_MAX_GOSSIP_SIZE` 环境变量可调整）
+  - 1200 字节是保守值，可适配大多数网络环境（典型以太网 MTU 1500 减去 IP/UDP/QUIC 开销）
+  - 此限制适用于 gossipsub 发布的单个消息
+  - 超过此大小的数据包将被丢弃并记录警告
+  
+- **批处理优化**：多个小包会批量聚合为单个 gossipsub 消息以提高效率
+  - 批处理大小受 `COCONET_MAX_GOSSIP_SIZE` 限制，默认等于消息大小限制
+  - 可通过 `COCONET_BATCH_MAX_BYTES` 调整（不应超过 `COCONET_MAX_GOSSIP_SIZE`）
+  - 可通过 `COCONET_BATCH_MAX_PKTS` 调整每批最大包数（默认 128）
+  - 可通过 `COCONET_BATCH_INTERVAL_MS` 调整批处理刷新间隔（默认 2 毫秒）
+
+**环境变量示例**：
+```bash
+# 增加消息大小限制（适用于 MTU 更大的网络）
+export COCONET_MAX_GOSSIP_SIZE=1400
+
+# 或降低限制（适用于受限网络，如某些移动网络）
+export COCONET_MAX_GOSSIP_SIZE=1000
+
+# 运行节点
+./CocoNet --relay --listen-port 36826
+```
+
+**常见问题**：
+- **错误 10040 (Windows) 或 "message too long" 错误**：
+  - 原因：UDP datagram 超过网络 MTU 限制
+  - 解决：降低 `COCONET_MAX_GOSSIP_SIZE`（如设为 1000 或 800）
+  
+- **"dropping packet: size exceeds gossipsub max_transmit_size" 警告**：
+  - 原因：TUN 传来的单个 IP 包超过 gossipsub 限制
+  - 解决：增加 `COCONET_MAX_GOSSIP_SIZE` 或降低 TUN MTU（`--mtu` 参数）
+  - 注意：通常 TUN MTU (1300/1400) 已大于 gossipsub 限制，需确保 `COCONET_MAX_GOSSIP_SIZE >= TUN MTU`
+
+- **"Not publishing a message that has already been published" 警告**：
+  - 原因：gossipsub 检测到重复消息
+  - 通常无需处理，这是 gossipsub 的正常去重机制
+
